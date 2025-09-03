@@ -3,7 +3,9 @@
 Personal repo of configs and scripts for Arch/CachyOS—mostly small fixes, sometimes personal tweaks.
 
 ## What’s inside
-`/stream_deck/wave_xlr` – tiny shell scripts for audio routing on PipeWire/WirePlumber (used with an Elgato Stream Deck).  
+
+### Elgato Products
+`/stream_deck/wave_xlr` – Shell scripts for audio routing on PipeWire/WirePlumber (can be used with an Elgato Stream Deck).  
 
 - `toggle-audio.sh` Script that toggles/set default sinks/sources via `wpctl`.
 - `toggle-mute.sh` Script that toggles hardware and software mute (and keeps them in sync) on an Elgato Wave XLR or Elgato Wave:X microphone

@@ -17,7 +17,7 @@ Personal repo of configs and scripts for Arch/CachyOS—mostly small fixes, some
 `/stream_deck/icons` – High quality PNG icons for use on an Elgato Stream Deck
 
 ## Requirements
-- Arch or derivative distrobution such as CachyOS
+- Arch or derivative distribution such as CachyOS
 - PipeWire + WirePlumber (`wpctl` available)
 - OpenDeck or another open source Stream Deck software
 

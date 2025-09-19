@@ -1,61 +1,126 @@
 #!/bin/bash
-# Toggle Elgato <-> Family, but robust against fast repeated presses.
+# Rotate default PipeWire sink across all output devices.
+# Strategy:
+# 1) Prefer pw-dump+jq (stable JSON across versions)
+# 2) Fallback to parsing `wpctl status`
+# 3) Keep lock + multi-pass stream move; allow exclude regex.
+
+set -euo pipefail
+export LC_ALL=C
 
 LOCK="/tmp/wpctl-toggle.lock"
 exec 9>"$LOCK"
-flock -n 9 || exit 0   # if another instance is running, bail silently
+flock -n 9 || exit 0
 
-NAME_ELGATO="alsa_output.usb-Elgato_Systems_Elgato_Wave_XLR_DS41K3A02721-00.pro-output-0"
-DESC_FAMILY="Family 17h/19h/1ah HD Audio Controller Analog Stereo"
+EXCLUDE_SINKS_REGEX="${EXCLUDE_SINKS_REGEX:-}"  # e.g. '(Dummy|Monitor|Easy Effects)'
 
-extract_id() { sed -nE 's/^[^0-9]*([0-9]+)\..*/\1/p' | head -n1; }
+has() { command -v "$1" >/dev/null 2>&1; }
 
-ID_ELGATO=$(wpctl status | grep -F "$NAME_ELGATO" | extract_id)
+# ---------- JSON path (preferred) ----------
+extract_sinks_json() {
+  # Emits: "<id>\t<name>"
+  # name preference: node.description > node.nick > node.name
+  pw-dump \
+  | jq -r '
+      .[]
+      | select(.type=="PipeWire:Interface:Node")
+      | select(.info.props["media.class"]=="Audio/Sink")
+      | [
+          (.id|tostring),
+          (.info.props["node.description"]
+           // .info.props["node.nick"]
+           // .info.props["node.name"])
+        ]
+      | @tsv
+    ' 2>/dev/null || true
+}
 
-ID_FAMILY=$(wpctl status \
+get_default_sink_id_json() {
+  # Try wpctl inspect first; it’s fast and stable
+  wpctl inspect @DEFAULT_AUDIO_SINK@ 2>/dev/null \
+    | sed -nE 's/^[[:space:]]*id = ([0-9]+).*$/\1/p' \
+    | head -n1
+}
+
+# ---------- Fallback (wpctl status) ----------
+extract_sinks_status() {
+  wpctl status \
   | sed -n '/Sinks:/,/Sources:/p' \
-  | grep -F "$DESC_FAMILY" | extract_id)
+  | sed '1d;$d' \
+  | sed 's/^[[:space:]]*[│└├┌└─]*[[:space:]]*//; s/^[[:space:]]*\*//;' \
+  | awk '$1 ~ /^[0-9]+\.$/ {
+           id=$1; sub(/\./,"",id);
+           $1=""; sub(/^[[:space:]]*/,"");
+           sub(/[[:space:]]*\[vol:.*$/,"");
+           gsub(/[[:space:]]+$/,"");
+           if(length($0)>0) print id "\t" $0
+         }'
+}
 
-if [[ -z "$ID_FAMILY" ]]; then
-  ID_FAMILY=$(wpctl status | grep -F "Family 17h" | grep -F "[Audio/Sink]" | extract_id)
-fi
+get_default_sink_id_status() {
+  wpctl inspect @DEFAULT_AUDIO_SINK@ 2>/dev/null \
+    | sed -nE 's/^[[:space:]]*id = ([0-9]+).*$/\1/p' \
+    | head -n1 \
+  || true
+  # If empty, parse the starred line
+  if [[ -z "${id:-}" ]]; then
+    id="$(wpctl status \
+        | sed -n '/Sinks:/,/Sources:/p' \
+        | grep -E '^\s*[│└├┌└─]*\s*\*' \
+        | sed -E 's/^[[:space:]]*[│└├┌└─]*[[:space:]]*\*//; s/^[[:space:]]*([0-9]+)\..*$/\1/' \
+        | head -n1 || true)"
+  fi
+  echo "${id:-}"
+}
 
-if [[ -z "$ID_ELGATO" || -z "$ID_FAMILY" ]]; then
-  echo "❌ Could not resolve IDs. ELGATO='$ID_ELGATO' FAMILY='$ID_FAMILY'"; exit 1
-fi
-
-DEF_NODE=$(wpctl status | awk '/Default Configured Devices:/ {f=1; next} f && /Audio\/Sink/ {print $NF; exit}')
-
-if [[ "$DEF_NODE" == "$NAME_ELGATO" ]]; then
-  TARGET="$ID_FAMILY"; TOAST="🔊 Output → Family 17h"
-else
-  TARGET="$ID_ELGATO"; TOAST="🔊 Output → Elgato Wave XLR"
-fi
-
-# 1) Flip default
-wpctl set-default "$TARGET"
-
-# small settle for WirePlumber routing metadata propagation
-sleep 0.15
-
-# 2) Move all active output streams; retry a few times to catch stragglers
 move_streams_once() {
+  # Move active output streams to current default
   wpctl status \
   | awk '/^ └─ Streams:/,/^$/{ if ($1 ~ /^[0-9]+\./){gsub(/\./,"",$1); print $1} }' \
   | while read -r sid; do
-      # Only move output streams
       if wpctl inspect "$sid" 2>/dev/null | grep -q 'media.class = "Stream/Output"'; then
-        # Send to whatever is CURRENT default (resilient if default changed again)
-        wpctl move-node "$sid" @DEFAULT_AUDIO_SINK@ >/dev/null 2>&1
+        wpctl move-node "$sid" @DEFAULT_AUDIO_SINK@ >/dev/null 2>&1 || true
       fi
     done
 }
 
-# Try a few quick passes to avoid races on fast presses
-for _ in 1 2 3; do
-  move_streams_once
-  sleep 0.15
+# ---------- collect sinks ----------
+SINK_LINES=()
+if has pw-dump && has jq; then
+  while IFS= read -r line; do SINK_LINES+=("$line"); done < <(extract_sinks_json)
+fi
+# Fallback if JSON path produced nothing
+if ((${#SINK_LINES[@]}==0)); then
+  while IFS= read -r line; do SINK_LINES+=("$line"); done < <(extract_sinks_status)
+fi
+
+# Optional exclude by regex
+if [[ -n "$EXCLUDE_SINKS_REGEX" && ${#SINK_LINES[@]} -gt 0 ]]; then
+  mapfile -t SINK_LINES < <(printf '%s\n' "${SINK_LINES[@]}" | grep -Pv -- "$EXCLUDE_SINKS_REGEX" || true)
+fi
+
+((${#SINK_LINES[@]})) || { echo "❌ No sinks found."; exit 1; }
+
+IDS=(); NAMES=()
+for ln in "${SINK_LINES[@]}"; do
+  IDS+=("${ln%%$'\t'*}")
+  NAMES+=("${ln#*$'\t'}")
 done
 
-#command -v notify-send >/dev/null && notify-send "$TOAST" || echo "$TOAST"
-echo "$TOAST"
+((${#IDS[@]}>=2)) || { echo "❌ Only one sink available; nothing to toggle."; exit 1; }
+
+# figure current default
+CURR_ID="$(get_default_sink_id_json || true)"
+[[ -n "$CURR_ID" ]] || CURR_ID="$(get_default_sink_id_status || true)"
+idx_curr=0
+for i in "${!IDS[@]}"; do [[ "${IDS[$i]}" == "$CURR_ID" ]] && { idx_curr=$i; break; }; done
+
+# rotate
+next_idx=$(( (idx_curr + 1) % ${#IDS[@]} ))
+TARGET_ID="${IDS[$next_idx]}"; TARGET_NAME="${NAMES[$next_idx]}"
+
+wpctl set-default "$TARGET_ID"
+sleep 0.15
+for _ in 1 2 3; do move_streams_once; sleep 0.15; done
+
+echo "🔊 Output → ${TARGET_NAME}"
